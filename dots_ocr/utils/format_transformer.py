@@ -172,8 +172,12 @@ def layoutjson2md(image: Image.Image, cells: list, text_key: str = 'text', no_pa
             text_items.append(f"![]({image_base64})")
         elif cell['category'] == 'Formula':
             text_items.append(get_formula_in_markdown(text))
-        else:            
+        else:
             text = clean_text(text)
+            if cell['category'] == 'Title' and not text.startswith('#'):
+                text = f'# {text}'
+            elif cell['category'] == 'Section-header' and not text.startswith('#'):
+                text = f'## {text}'
             text_items.append(f"{text}")
 
     markdown_text = '\n\n'.join(text_items)

@@ -121,3 +121,6 @@ dmypy.json
 temp/
 output/ 
 # playground/
+test_result_*
+*.pdf
+*.pid
