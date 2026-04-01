@@ -14,4 +14,9 @@ setup(
     description='dots.ocr: Multilingual Document Layout Parsing in one Vision-Language Model',
     url="https://github.com/rednote-hilab/dots.ocr",
     python_requires=">=3.10",
+    entry_points={
+        "console_scripts": [
+            "dots_ocr=test_api:main",
+        ],
+    },
 )

@@ -447,7 +447,12 @@ def build_citation_key_map(pages_data: list[dict]) -> dict[tuple[str, str], str]
     """
     key_map: dict[tuple[str, str], str] = {}
     for page in pages_data:
-        for cell in (page.get("layout") or []):
+        layout = page.get("layout")
+        if not isinstance(layout, list):
+            continue
+        for cell in layout:
+            if not isinstance(cell, dict):
+                continue
             if cell.get("category") != "Citation" or "key" not in cell:
                 continue
             key = cell["key"]
@@ -644,7 +649,12 @@ _PAGE_SENTINEL = '\n\n<!-- PAGE_BREAK -->\n\n'
 def _detect_citation_style(pages_data: list[dict]) -> str:
     """Detect whether the document uses numeric [N] or author-year citations."""
     for page in pages_data:
-        for cell in (page.get("layout") or []):
+        layout = page.get("layout")
+        if not isinstance(layout, list):
+            continue
+        for cell in layout:
+            if not isinstance(cell, dict):
+                continue
             if cell.get("category") == "Text":
                 text = cell.get("text", "")
                 if is_reference_block(text):

@@ -124,3 +124,5 @@ output/
 test_result_*
 *.pdf
 *.pid
+em_knowledgebase
+test_pdfs

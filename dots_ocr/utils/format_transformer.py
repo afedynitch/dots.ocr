@@ -122,54 +122,76 @@ def get_formula_in_markdown(text: str) -> str:
 def clean_text(text: str) -> str:
     """
     Cleans text by removing extra whitespace.
-    
+
     Args:
         text: The original text.
-        
+
     Returns:
         str: The cleaned text.
     """
     if not text:
         return ""
-    
+
     # Remove leading and trailing whitespace
     text = text.strip()
-    
+
     # Replace multiple consecutive whitespace characters with a single space
     if text[:2] == '`$' and text[-2:] == '$`':
         text = text[1:-1]
-    
+
+    # Ensure blank lines between reference entries (e.g. "[1] ...\n[2] ...")
+    # so they render as separate paragraphs in markdown.
+    text = re.sub(r'\n(?=\[\d+\])', '\n\n', text)
+
     return text
 
 
-def layoutjson2md(image: Image.Image, cells: list, text_key: str = 'text', no_page_hf: bool = False) -> str:
+def layoutjson2md(image: Image.Image, cells: list, text_key: str = 'text',
+                   no_page_hf: bool = False, img_dir: str | None = None,
+                   img_rel_prefix: str | None = None) -> str:
     """
     Converts a layout JSON format to Markdown.
-    
+
     In the layout JSON, formulas are LaTeX, tables are HTML, and text is Markdown.
-    
+
     Args:
         image: A PIL Image object.
         cells: A list of dictionaries, each representing a layout cell.
         text_key: The key for the text field in the cell dictionary.
-        no_page_header_footer: If True, skips page headers and footers.
-        
+        no_page_hf: If True, skips page headers and footers.
+        img_dir: If set, save cropped images to this directory instead of
+                 embedding them as base64. The directory is created if needed.
+        img_rel_prefix: Relative path prefix used in the markdown image links
+                        (e.g. ``img/docname``).  Defaults to *img_dir* basename.
+
     Returns:
         str: The text in Markdown format.
     """
     text_items = []
+    pic_counter = 0
+
+    if img_dir is not None:
+        os.makedirs(img_dir, exist_ok=True)
+        if img_rel_prefix is None:
+            img_rel_prefix = os.path.basename(img_dir)
 
     for i, cell in enumerate(cells):
         x1, y1, x2, y2 = [int(coord) for coord in cell['bbox']]
         text = cell.get(text_key, "")
-        
+
         if no_page_hf and cell['category'] in ['Page-header', 'Page-footer']:
             continue
-        
+
         if cell['category'] == 'Picture':
             image_crop = image.crop((x1, y1, x2, y2))
-            image_base64 = PILimage_to_base64(image_crop)
-            text_items.append(f"![]({image_base64})")
+            if img_dir is not None:
+                pic_counter += 1
+                img_filename = f"img_{pic_counter:03d}.png"
+                image_crop.save(os.path.join(img_dir, img_filename))
+                text_items.append(f"![]({img_rel_prefix}/{img_filename})")
+            else:
+                image_base64 = PILimage_to_base64(image_crop)
+                text_items.append(f"![]({image_base64})")
         elif cell['category'] == 'Formula':
             text_items.append(get_formula_in_markdown(text))
         else:

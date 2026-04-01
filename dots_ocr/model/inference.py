@@ -18,7 +18,11 @@ def inference_with_vllm(
         ):
     
     addr = f"{protocol}://{ip}:{port}/v1"
-    client = OpenAI(api_key="{}".format(os.environ.get("API_KEY", "0")), base_url=addr)
+    client = OpenAI(
+        api_key="{}".format(os.environ.get("API_KEY", "0")),
+        base_url=addr,
+        timeout=1800.0,
+    )
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
