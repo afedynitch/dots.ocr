@@ -18,6 +18,7 @@ Stop via:  ./stop_server.sh
 
 from __future__ import annotations
 
+import base64
 import os
 import json
 import re
@@ -768,6 +769,7 @@ class PageResult(BaseModel):
     layout: list | str | None = Field(default=None, description="Parsed layout cells (list of dicts with bbox, category, text) or raw text")
     markdown: str | None = Field(default=None, description="Markdown rendering of the page content")
     markdown_nohf: str | None = Field(default=None, description="Markdown rendering without page headers/footers")
+    image_base64: str | None = Field(default=None, description="Base64-encoded layout image (JPEG), included when include_images=true")
 
 
 class OcrResponse(BaseModel):
@@ -833,6 +835,7 @@ async def ocr(
     ),
     dpi: int = Form(default=200, description="DPI for PDF rasterization (default 200)"),
     num_threads: int = Form(default=16, description="Parallel threads for multi-page PDFs"),
+    include_images: bool = Form(default=False, description="Include base64-encoded layout images in the response"),
 ):
     # Validate vLLM is up
     if not is_vllm_running():
@@ -894,11 +897,20 @@ async def ocr(
                 with open(md_nohf_path, "r", encoding="utf-8") as mf:
                     markdown_nohf = mf.read()
 
+            # Optionally include base64-encoded layout image
+            image_b64 = None
+            if include_images:
+                img_path = r.get("layout_image_path")
+                if img_path and os.path.exists(img_path):
+                    with open(img_path, "rb") as img_f:
+                        image_b64 = base64.b64encode(img_f.read()).decode("ascii")
+
             pages.append(PageResult(
                 page_no=r.get("page_no", 0),
                 layout=layout,
                 markdown=markdown,
                 markdown_nohf=markdown_nohf,
+                image_base64=image_b64,
             ))
 
         # Citation postprocessing (only for layout+OCR mode)
