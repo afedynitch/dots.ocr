@@ -3,14 +3,20 @@ DotsOCR HTTP API Server
 ========================
 
 A FastAPI-based HTTP API that wraps the DotsOCR model for PDF/image OCR.
-It manages a vLLM backend server automatically (launches if not running).
+It manages one or more vLLM backend instances automatically — one per GPU —
+and load-balances concurrent requests across them via round-robin.
+
+Set VLLM_GPU="0,1,2,3" to run 4 instances on ports 8000-8003.
 
 Endpoints:
-    POST /ocr          - Upload a PDF or image file for OCR processing
-    GET  /health       - Check API server and vLLM backend health
-    GET  /prompts      - List available prompt modes and their descriptions
-    POST /vllm/start   - Manually start the vLLM backend
-    POST /vllm/stop    - Manually stop the vLLM backend
+    POST /ocr              - Upload a PDF or image file for OCR processing (sync)
+    POST /ocr/submit       - Submit an async OCR job, returns job_id
+    GET  /ocr/jobs/{id}    - Poll job progress and retrieve results
+    GET  /ocr/jobs         - List all tracked jobs
+    GET  /health           - Check API server and per-instance vLLM health
+    GET  /prompts          - List available prompt modes and their descriptions
+    POST /vllm/start       - Manually start all vLLM instances
+    POST /vllm/stop        - Manually stop all vLLM instances
 
 Start via: ./start_server.sh
 Stop via:  ./stop_server.sh
@@ -18,7 +24,6 @@ Stop via:  ./stop_server.sh
 
 from __future__ import annotations
 
-import base64
 import os
 import json
 import re
@@ -33,55 +38,91 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import logging
+
 import httpx
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+logger = logging.getLogger("dotsocr")
+
 # ---------------------------------------------------------------------------
 # Configuration (override via environment variables)
 # ---------------------------------------------------------------------------
 VLLM_HOST = os.getenv("VLLM_HOST", "localhost")
-VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
-VLLM_GPU = os.getenv("VLLM_GPU", "0")
+VLLM_BASE_PORT = int(os.getenv("VLLM_PORT", "8000"))
+VLLM_GPU = os.getenv("VLLM_GPU", "0")  # comma-separated for multi-GPU, e.g. "0,1,2,3"
 MODEL_PATH = os.getenv("MODEL_PATH", "./weights/DotsOCR_1_5")
 MODEL_NAME = os.getenv("MODEL_NAME", "model")
 API_PORT = int(os.getenv("API_PORT", "8300"))
 
-VLLM_PROCESS: subprocess.Popen | None = None
+# Parse GPU list — each GPU gets its own vLLM instance
+VLLM_GPUS: list[str] = [g.strip() for g in VLLM_GPU.split(",") if g.strip()]
+
+# Per-instance state: port assignments and processes
+VLLM_PORTS: list[int] = [VLLM_BASE_PORT + i for i in range(len(VLLM_GPUS))]
+VLLM_PROCESSES: list[subprocess.Popen | None] = [None] * len(VLLM_GPUS)
+
+# Round-robin counter for load balancing
+_rr_lock = threading.Lock()
+_rr_counter = 0
 
 # ---------------------------------------------------------------------------
 # vLLM management helpers
 # ---------------------------------------------------------------------------
 
-def _vllm_health_url() -> str:
-    return f"http://{VLLM_HOST}:{VLLM_PORT}/health"
+def _vllm_health_url(port: int) -> str:
+    return f"http://{VLLM_HOST}:{port}/health"
 
 
-def is_vllm_running() -> bool:
-    """Check if the vLLM server is responsive."""
+def _is_instance_running(port: int) -> bool:
+    """Check if a single vLLM instance is responsive."""
     try:
-        r = httpx.get(_vllm_health_url(), timeout=5)
+        r = httpx.get(_vllm_health_url(port), timeout=5)
         return r.status_code == 200
     except Exception:
         return False
 
 
-def start_vllm() -> dict:
-    """Launch the vLLM server as a subprocess if not already running."""
-    global VLLM_PROCESS
+def is_vllm_running() -> bool:
+    """Check if at least one vLLM instance is responsive."""
+    return any(_is_instance_running(port) for port in VLLM_PORTS)
 
-    if is_vllm_running():
-        return {"status": "already_running"}
+
+def get_healthy_ports() -> list[int]:
+    """Return list of ports for healthy vLLM instances."""
+    return [port for port in VLLM_PORTS if _is_instance_running(port)]
+
+
+def next_vllm_port() -> int | None:
+    """Pick the next healthy vLLM port via round-robin."""
+    global _rr_counter
+    healthy = get_healthy_ports()
+    if not healthy:
+        logger.warning("No healthy vLLM instances available")
+        return None
+    with _rr_lock:
+        idx = _rr_counter % len(healthy)
+        _rr_counter += 1
+    port = healthy[idx]
+    gpu = VLLM_GPUS[VLLM_PORTS.index(port)] if port in VLLM_PORTS else "?"
+    logger.info("Round-robin selected port %d (GPU %s) — %d/%d healthy",
+                port, gpu, len(healthy), len(VLLM_PORTS))
+    return port
+
+
+def _start_single_instance(gpu: str, port: int, idx: int) -> dict:
+    """Launch a single vLLM instance on the given GPU and port."""
+    if _is_instance_running(port):
+        return {"gpu": gpu, "port": port, "status": "already_running"}
 
     model_abs = str(Path(MODEL_PATH).resolve())
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = VLLM_GPU
-    # Ensure the model directory is on PYTHONPATH for custom modelling code
+    env["CUDA_VISIBLE_DEVICES"] = gpu
     env["PYTHONPATH"] = str(Path(model_abs).parent) + ":" + env.get("PYTHONPATH", "")
 
-    # Resolve vllm binary — use the one from the same venv as the current Python
     vllm_bin = shutil.which("vllm") or str(Path(sys.executable).parent / "vllm")
 
     cmd = [
@@ -91,33 +132,70 @@ def start_vllm() -> dict:
         "--chat-template-content-format", "string",
         "--served-model-name", MODEL_NAME,
         "--trust-remote-code",
-        "--port", str(VLLM_PORT),
+        "--port", str(port),
     ]
 
-    VLLM_PROCESS = subprocess.Popen(cmd, env=env)
+    VLLM_PROCESSES[idx] = subprocess.Popen(cmd, env=env)
 
-    # Wait for the server to become healthy (up to 5 min)
+    # Wait for healthy (up to 5 min), but bail early if the process dies
     for _ in range(300):
-        if is_vllm_running():
-            return {"status": "started", "pid": VLLM_PROCESS.pid}
+        if _is_instance_running(port):
+            return {"gpu": gpu, "port": port, "status": "started", "pid": VLLM_PROCESSES[idx].pid}
+        if VLLM_PROCESSES[idx].poll() is not None:
+            rc = VLLM_PROCESSES[idx].returncode
+            VLLM_PROCESSES[idx] = None
+            return {"gpu": gpu, "port": port, "status": "crashed", "returncode": rc}
         time.sleep(1)
 
-    return {"status": "timeout", "message": "vLLM did not become healthy within 5 minutes"}
+    return {"gpu": gpu, "port": port, "status": "timeout"}
+
+
+VLLM_START_RETRIES = int(os.getenv("VLLM_START_RETRIES", "2"))
+
+
+def start_vllm() -> dict:
+    """Launch vLLM instances sequentially (one per GPU), retrying failures.
+
+    Sequential startup avoids CUDA/NCCL initialization races and system
+    resource contention that can crash instances when launched in parallel.
+    """
+    results = []
+    for idx, (gpu, port) in enumerate(zip(VLLM_GPUS, VLLM_PORTS)):
+        r = None
+        for attempt in range(1, VLLM_START_RETRIES + 1):
+            print(f"Starting vLLM instance {idx} on GPU {gpu}, port {port} (attempt {attempt}/{VLLM_START_RETRIES})...")
+            r = _start_single_instance(gpu, port, idx)
+            print(f"  → {r['status']}")
+            if r["status"] in ("started", "already_running"):
+                break
+            # Brief pause before retry to let resources settle
+            time.sleep(5)
+        results.append(r)
+
+    started = sum(1 for r in results if r["status"] in ("started", "already_running"))
+    return {
+        "status": "ok" if started > 0 else "failed",
+        "instances": results,
+        "num_gpus": len(VLLM_GPUS),
+        "num_healthy": started,
+    }
 
 
 def stop_vllm() -> dict:
-    """Stop the managed vLLM subprocess."""
-    global VLLM_PROCESS
-    if VLLM_PROCESS is not None:
-        VLLM_PROCESS.terminate()
-        try:
-            VLLM_PROCESS.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            VLLM_PROCESS.kill()
-        pid = VLLM_PROCESS.pid
-        VLLM_PROCESS = None
-        return {"status": "stopped", "pid": pid}
-    return {"status": "not_managed", "message": "No vLLM process managed by this server"}
+    """Stop all managed vLLM subprocesses."""
+    stopped = []
+    for idx, proc in enumerate(VLLM_PROCESSES):
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            stopped.append({"gpu": VLLM_GPUS[idx], "port": VLLM_PORTS[idx], "pid": proc.pid})
+            VLLM_PROCESSES[idx] = None
+    if stopped:
+        return {"status": "stopped", "instances": stopped}
+    return {"status": "not_managed", "message": "No vLLM processes managed by this server"}
 
 
 # ---------------------------------------------------------------------------
@@ -752,10 +830,18 @@ app = FastAPI(
 
 # ---- Response models --------------------------------------------------------
 
+class VllmInstanceHealth(BaseModel):
+    gpu: str = Field(description="GPU device ID")
+    port: int = Field(description="vLLM instance port")
+    status: str = Field(description="'ok' or 'unavailable'")
+
+
 class HealthResponse(BaseModel):
     api: str = Field(description="API server status", examples=["ok"])
-    vllm: str = Field(description="vLLM backend status: 'ok' or 'unavailable'")
-    vllm_url: str = Field(description="vLLM health endpoint URL")
+    vllm: str = Field(description="Overall vLLM status: 'ok' if any instance is healthy")
+    num_gpus: int = Field(description="Total number of configured GPU instances")
+    num_healthy: int = Field(description="Number of healthy vLLM instances")
+    instances: list[VllmInstanceHealth] = Field(description="Per-instance health status")
 
 
 class VllmActionResponse(BaseModel):
@@ -769,7 +855,6 @@ class PageResult(BaseModel):
     layout: list | str | None = Field(default=None, description="Parsed layout cells (list of dicts with bbox, category, text) or raw text")
     markdown: str | None = Field(default=None, description="Markdown rendering of the page content")
     markdown_nohf: str | None = Field(default=None, description="Markdown rendering without page headers/footers")
-    image_base64: str | None = Field(default=None, description="Base64-encoded layout image (JPEG), included when include_images=true")
 
 
 class OcrResponse(BaseModel):
@@ -779,17 +864,162 @@ class OcrResponse(BaseModel):
     pages: list[PageResult] = Field(description="Per-page OCR results")
 
 
+class JobStatusResponse(BaseModel):
+    job_id: str = Field(description="Unique job identifier")
+    status: str = Field(description="'pending', 'running', 'completed', or 'failed'")
+    filename: str | None = Field(default=None, description="Original uploaded filename")
+    gpu: str | None = Field(default=None, description="GPU handling this job")
+    vllm_port: int | None = Field(default=None, description="vLLM port handling this job")
+    pages_completed: int = Field(default=0, description="Number of pages processed so far")
+    pages_total: int = Field(default=0, description="Total number of pages")
+    progress: float = Field(default=0.0, description="Progress 0.0–1.0")
+    error: str | None = Field(default=None, description="Error message if failed")
+    result: OcrResponse | None = Field(default=None, description="OCR result (only when completed)")
+
+
+class JobSubmitResponse(BaseModel):
+    job_id: str = Field(description="Unique job identifier — poll GET /ocr/jobs/{job_id}")
+
+
+# ---- Job tracking ------------------------------------------------------------
+
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+# Auto-cleanup: keep completed/failed jobs for 30 minutes
+_JOB_TTL_SECONDS = 1800
+
+
+def _cleanup_old_jobs() -> None:
+    """Remove jobs older than _JOB_TTL_SECONDS."""
+    now = time.time()
+    with _jobs_lock:
+        expired = [jid for jid, j in _jobs.items()
+                   if j["status"] in ("completed", "failed")
+                   and now - j.get("finished_at", now) > _JOB_TTL_SECONDS]
+        for jid in expired:
+            _jobs.pop(jid, None)
+
+
+def _run_ocr_job(job_id: str, input_path: str, work_dir: str,
+                 filename: str, ext: str, prompt_mode: str,
+                 dpi: int, num_threads: int, vllm_port: int) -> None:
+    """Execute OCR in a background thread, updating job progress."""
+    try:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "running"
+
+        from dots_ocr.parser import DotsOCRParser
+        from dots_ocr.utils.doc_utils import load_images_from_pdf
+        from dots_ocr.utils.image_utils import PILimage_to_base64
+        from PIL import Image
+
+        def page_callback(completed: int, total: int) -> None:
+            with _jobs_lock:
+                _jobs[job_id]["pages_completed"] = completed
+                _jobs[job_id]["pages_total"] = total
+                _jobs[job_id]["progress"] = completed / total if total else 0.0
+
+        parser = DotsOCRParser(
+            ip=VLLM_HOST,
+            port=vllm_port,
+            model_name=MODEL_NAME,
+            dpi=dpi,
+            num_thread=num_threads,
+            output_dir=work_dir,
+        )
+        results = parser.parse_file(input_path, output_dir=work_dir,
+                                    prompt_mode=prompt_mode,
+                                    page_callback=page_callback)
+
+        # For single images, mark progress as complete
+        with _jobs_lock:
+            _jobs[job_id]["pages_completed"] = len(results)
+            _jobs[job_id]["pages_total"] = len(results)
+            _jobs[job_id]["progress"] = 1.0
+
+        # Load page images for figure cropping
+        if ext == ".pdf":
+            page_images = load_images_from_pdf(input_path, dpi=dpi)
+        else:
+            page_images = [Image.open(input_path).convert("RGB")]
+
+        # Build response (same logic as sync /ocr)
+        pages = []
+        for r in results:
+            layout = None
+            markdown = None
+            layout_path = r.get("layout_info_path")
+            if layout_path and os.path.exists(layout_path):
+                with open(layout_path, "r", encoding="utf-8") as lf:
+                    layout = json.load(lf)
+            page_no = r.get("page_no", 0)
+            if isinstance(layout, list) and page_no < len(page_images):
+                origin_img = page_images[page_no]
+                for cell in layout:
+                    if isinstance(cell, dict) and cell.get("category") == "Picture":
+                        try:
+                            x1, y1, x2, y2 = [int(c) for c in cell["bbox"]]
+                            crop = origin_img.crop((x1, y1, x2, y2))
+                            cell["image_base64"] = PILimage_to_base64(crop)
+                        except Exception:
+                            pass
+            md_path = r.get("md_content_path")
+            if md_path and os.path.exists(md_path):
+                with open(md_path, "r", encoding="utf-8") as mf:
+                    markdown = mf.read()
+            markdown_nohf = None
+            md_nohf_path = r.get("md_content_nohf_path")
+            if md_nohf_path and os.path.exists(md_nohf_path):
+                with open(md_nohf_path, "r", encoding="utf-8") as mf:
+                    markdown_nohf = mf.read()
+            pages.append(PageResult(
+                page_no=page_no, layout=layout,
+                markdown=markdown, markdown_nohf=markdown_nohf,
+            ))
+
+        if prompt_mode == "prompt_layout_all_en":
+            pages_dicts = [p.model_dump() for p in pages]
+            postprocess_citations(pages_dicts)
+            pages = [PageResult(**pd) for pd in pages_dicts]
+
+        ocr_result = OcrResponse(
+            filename=filename, num_pages=len(pages),
+            prompt_mode=prompt_mode, pages=pages,
+        )
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "completed"
+            _jobs[job_id]["result"] = ocr_result
+            _jobs[job_id]["finished_at"] = time.time()
+        logger.info("Job %s completed: %d pages", job_id, len(pages))
+
+    except Exception as exc:
+        logger.exception("Job %s failed", job_id)
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "failed"
+            _jobs[job_id]["error"] = str(exc)
+            _jobs[job_id]["finished_at"] = time.time()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 # ---- Endpoints ---------------------------------------------------------------
 
 @app.get("/health", response_model=HealthResponse, tags=["System"],
          summary="Health check",
          description="Returns the health status of both the API server and the vLLM backend.")
 async def health():
-    vllm_ok = is_vllm_running()
+    instances = []
+    for gpu, port in zip(VLLM_GPUS, VLLM_PORTS):
+        ok = _is_instance_running(port)
+        instances.append(VllmInstanceHealth(gpu=gpu, port=port, status="ok" if ok else "unavailable"))
+    num_healthy = sum(1 for i in instances if i.status == "ok")
     return HealthResponse(
         api="ok",
-        vllm="ok" if vllm_ok else "unavailable",
-        vllm_url=_vllm_health_url(),
+        vllm="ok" if num_healthy > 0 else "unavailable",
+        num_gpus=len(VLLM_GPUS),
+        num_healthy=num_healthy,
+        instances=instances,
     )
 
 
@@ -835,11 +1065,14 @@ async def ocr(
     ),
     dpi: int = Form(default=200, description="DPI for PDF rasterization (default 200)"),
     num_threads: int = Form(default=16, description="Parallel threads for multi-page PDFs"),
-    include_images: bool = Form(default=False, description="Include base64-encoded layout images in the response"),
 ):
-    # Validate vLLM is up
-    if not is_vllm_running():
-        raise HTTPException(status_code=503, detail="vLLM backend is not available. POST /vllm/start to launch it.")
+    # Validate vLLM is up — pick a healthy instance via round-robin
+    vllm_port = next_vllm_port()
+    if vllm_port is None:
+        raise HTTPException(status_code=503, detail="No vLLM backend is available. POST /vllm/start to launch them.")
+
+    gpu = VLLM_GPUS[VLLM_PORTS.index(vllm_port)] if vllm_port in VLLM_PORTS else "?"
+    logger.info("OCR request: %s → GPU %s (port %d)", file.filename, gpu, vllm_port)
 
     # Validate prompt mode
     from dots_ocr.utils.prompts import dict_promptmode_to_prompt
@@ -860,17 +1093,26 @@ async def ocr(
         with open(input_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # Run OCR via DotsOCRParser
+        # Run OCR via DotsOCRParser — route to the selected vLLM instance
         from dots_ocr.parser import DotsOCRParser
+        from dots_ocr.utils.doc_utils import load_images_from_pdf
+        from dots_ocr.utils.image_utils import PILimage_to_base64
+        from PIL import Image
         parser = DotsOCRParser(
             ip=VLLM_HOST,
-            port=VLLM_PORT,
+            port=vllm_port,
             model_name=MODEL_NAME,
             dpi=dpi,
             num_thread=num_threads,
             output_dir=work_dir,
         )
         results = parser.parse_file(input_path, output_dir=work_dir, prompt_mode=prompt_mode)
+
+        # Load page images for figure cropping
+        if ext == ".pdf":
+            page_images = load_images_from_pdf(input_path, dpi=dpi)
+        else:
+            page_images = [Image.open(input_path).convert("RGB")]
 
         # Build response
         pages = []
@@ -883,6 +1125,19 @@ async def ocr(
             if layout_path and os.path.exists(layout_path):
                 with open(layout_path, "r", encoding="utf-8") as lf:
                     layout = json.load(lf)
+
+            # Embed cropped figures as base64 in Picture cells
+            page_no = r.get("page_no", 0)
+            if isinstance(layout, list) and page_no < len(page_images):
+                origin_img = page_images[page_no]
+                for cell in layout:
+                    if isinstance(cell, dict) and cell.get("category") == "Picture":
+                        try:
+                            x1, y1, x2, y2 = [int(c) for c in cell["bbox"]]
+                            crop = origin_img.crop((x1, y1, x2, y2))
+                            cell["image_base64"] = PILimage_to_base64(crop)
+                        except Exception:
+                            pass
 
             # Read markdown if present
             md_path = r.get("md_content_path")
@@ -897,20 +1152,11 @@ async def ocr(
                 with open(md_nohf_path, "r", encoding="utf-8") as mf:
                     markdown_nohf = mf.read()
 
-            # Optionally include base64-encoded layout image
-            image_b64 = None
-            if include_images:
-                img_path = r.get("layout_image_path")
-                if img_path and os.path.exists(img_path):
-                    with open(img_path, "rb") as img_f:
-                        image_b64 = base64.b64encode(img_f.read()).decode("ascii")
-
             pages.append(PageResult(
-                page_no=r.get("page_no", 0),
+                page_no=page_no,
                 layout=layout,
                 markdown=markdown,
                 markdown_nohf=markdown_nohf,
-                image_base64=image_b64,
             ))
 
         # Citation postprocessing (only for layout+OCR mode)
@@ -929,8 +1175,103 @@ async def ocr(
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@app.post("/ocr/submit", response_model=JobSubmitResponse, tags=["OCR"],
+          summary="Submit an OCR job (async)",
+          description=(
+              "Upload a PDF or image file for asynchronous OCR processing. "
+              "Returns a job_id immediately. Poll GET /ocr/jobs/{job_id} for progress and results."
+          ))
+async def ocr_submit(
+    file: UploadFile = File(
+        ..., description="PDF or image file to process (.pdf, .jpg, .jpeg, .png)"
+    ),
+    prompt_mode: str = Form(
+        default="prompt_layout_all_en",
+        description="OCR task prompt mode. See GET /prompts for available modes.",
+    ),
+    dpi: int = Form(default=200, description="DPI for PDF rasterization (default 200)"),
+    num_threads: int = Form(default=16, description="Parallel threads for multi-page PDFs"),
+):
+    # Validate vLLM is up
+    vllm_port = next_vllm_port()
+    if vllm_port is None:
+        raise HTTPException(status_code=503, detail="No vLLM backend is available. POST /vllm/start to launch them.")
+
+    from dots_ocr.utils.prompts import dict_promptmode_to_prompt
+    if prompt_mode not in dict_promptmode_to_prompt:
+        raise HTTPException(status_code=400, detail=f"Unknown prompt_mode '{prompt_mode}'. GET /prompts for options.")
+
+    filename = file.filename or "upload"
+    ext = os.path.splitext(filename)[1].lower()
+    allowed = {".pdf", ".jpg", ".jpeg", ".png"}
+    if ext not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{ext}'. Allowed: {sorted(allowed)}")
+
+    # Save upload
+    work_dir = tempfile.mkdtemp(prefix="dotsocr_")
+    input_path = os.path.join(work_dir, filename)
+    with open(input_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # Create job
+    job_id = uuid.uuid4().hex[:12]
+    gpu = VLLM_GPUS[VLLM_PORTS.index(vllm_port)] if vllm_port in VLLM_PORTS else None
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status": "pending",
+            "filename": filename,
+            "gpu": gpu,
+            "vllm_port": vllm_port,
+            "pages_completed": 0,
+            "pages_total": 0,
+            "progress": 0.0,
+            "error": None,
+            "result": None,
+        }
+
+    logger.info("Job %s submitted: %s → GPU %s (port %d)", job_id, filename, gpu, vllm_port)
+
+    # Launch background thread
+    threading.Thread(
+        target=_run_ocr_job, daemon=True,
+        args=(job_id, input_path, work_dir, filename, ext,
+              prompt_mode, dpi, num_threads, vllm_port),
+    ).start()
+
+    _cleanup_old_jobs()
+    return JobSubmitResponse(job_id=job_id)
+
+
+@app.get("/ocr/jobs/{job_id}", response_model=JobStatusResponse, tags=["OCR"],
+         summary="Get OCR job status and progress",
+         description="Poll this endpoint to track progress of an async OCR job.")
+async def ocr_job_status(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return JobStatusResponse(job_id=job_id, **job)
+
+
+@app.get("/ocr/jobs", response_model=list[JobStatusResponse], tags=["OCR"],
+         summary="List all OCR jobs",
+         description="Returns status of all tracked jobs (completed jobs expire after 30 minutes).")
+async def ocr_jobs_list():
+    _cleanup_old_jobs()
+    with _jobs_lock:
+        return [
+            JobStatusResponse(job_id=jid, **{k: v for k, v in j.items() if k != "result"})
+            for jid, j in _jobs.items()
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
     uvicorn.run("api_server:app", host="0.0.0.0", port=API_PORT, workers=1)
